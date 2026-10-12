@@ -1,0 +1,1193 @@
+---
+title: "Competing Risks Analysis for Beginners"
+subtitle: "Concepts, formulae in plain words, pictures, and a worked analysis in R"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    css: style.css
+    self_contained: true
+    mathjax: "https://cdn.jsdelivr.net/npm/mathjax@2.7.9/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.width = 8, fig.height = 4.6, dpi = 110,
+  out.width = "100%", class.source = "fold-show"
+)
+```
+
+```{r packages}
+library(survival)
+library(cmprsk)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+```
+
+```{r plot-style, include=FALSE}
+ink <- "#0b0b0b"
+ink2 <- "#52514e"
+muted <- "#898781"
+grid_col <- "#e1e0d9"
+axis_col <- "#c3c2b7"
+col_blue <- "#2a78d6"
+col_orange <- "#eb6834"
+col_aqua <- "#1baf7a"
+tint_blue <- "#d4e5f9"
+tint_orange <- "#fbddd0"
+tint_gray <- "#ecebe6"
+blue_ramp <- c("#86b6ef", "#3987e5", "#1c5cab")
+
+theme_cr <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text = element_text(colour = ink2),
+      plot.title = element_text(colour = ink, face = "bold", size = base_size + 2),
+      plot.subtitle = element_text(colour = ink2),
+      plot.title.position = "plot",
+      axis.text = element_text(colour = muted),
+      axis.title = element_text(colour = ink2),
+      panel.grid.major = element_line(colour = grid_col, linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      axis.line.x = element_line(colour = axis_col, linewidth = 0.5),
+      legend.position = "top",
+      legend.title = element_blank(),
+      legend.text = element_text(colour = ink2),
+      strip.text = element_text(colour = ink, face = "bold", hjust = 0),
+      plot.background = element_rect(fill = "white", colour = NA),
+      plot.margin = margin(8, 14, 8, 8)
+    )
+}
+theme_set(theme_cr())
+
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d)
+
+pfmt <- function(p) {
+  sapply(p, function(v) {
+    if (v < 0.001) "p < 0.001" else paste0("p = ", formatC(v, format = "f", digits = if (v < 0.01) 3 else 2))
+  })
+}
+```
+
+::: {.disclosure}
+**Note on authorship.** This tutorial was drafted with AI assistance (Claude, by Anthropic). It has not been peer-reviewed. Please check the formulae, results and references against the cited sources before relying on them.
+:::
+
+::: {.hero}
+
+**Who is this for?** Students and applied researchers who know the basics of survival analysis (Kaplan–Meier curves, hazards, the Cox model) and now meet data in which *more than one type of event can end follow-up*.
+
+**What you will take away.**
+
+1. Why ordinary survival tools quietly give the wrong answer when competing events are present.
+2. The handful of formulae that matter (cause-specific hazard, cumulative incidence, subdistribution hazard), each followed by what it *means* in everyday language.
+3. How to estimate, plot, compare and model competing risks in **R**, on a real cohort of 1,384 patients.
+
+**How to read it.** Sections 1–3 build the ideas, Sections 4–7 show the methods on small examples and simulations, Section 8 is a complete data analysis, and Section 9 is a one-page checklist. Every R chunk can be folded away with the *Code* button at the top right.
+
+:::
+
+# Why competing risks? {#why}
+
+## A motivating question
+
+Consider patients diagnosed with a benign blood condition called *monoclonal gammopathy of undetermined significance* (MGUS). A small fraction go on to develop a plasma cell cancer (PCM, for plasma cell malignancy). A natural research question is:
+
+> *What is the probability that a newly diagnosed patient progresses to PCM within 10 years?*
+
+The tempting analysis is a Kaplan–Meier curve for "time to PCM" in which patients who die without ever developing PCM are treated as *censored*. But MGUS patients are mostly older, and many die of other causes first. A patient who has died will **never** develop PCM, and that is very different from a patient who simply moved away and stopped being followed.
+
+::: {.keyidea}
+A **competing risk** is an event whose occurrence *prevents* the event of interest from ever happening (or changes the chance that it happens). Death from another cause is the classic example.
+:::
+
+Other everyday examples:
+
+| Setting | Event of interest | Competing event(s) |
+|---|---|---|
+| Stem-cell transplantation | Relapse of leukaemia | Death from transplant complications |
+| Cardiology | Death from heart disease | Death from cancer or other causes |
+| Ageing studies | Onset of dementia | Death before dementia |
+| Infectious disease | Recovery | Death |
+| Reliability engineering | Failure by mechanism A | Failure by mechanism B |
+
+## Competing events are not censoring
+
+Censoring and competing events both stop us from observing the event of interest, but they mean different things.
+
+| | **Censoring** | **Competing event** |
+|---|---|---|
+| What happened | Follow-up ended (study closed, lost to follow-up) | A different event occurred first |
+| Is the person still *able* to have the event of interest? | **Yes**, we just stopped watching | **No** (or not in the same way) |
+| What we know | The event time is later than the last visit | The event of interest will never be observed |
+| Usual assumption | Non-informative ("independent") censoring | None needed: it is an outcome in its own right |
+
+## The picture to keep in mind
+
+Competing risks are the simplest possible "multi-state model": everyone starts in one state, and the first event moves them to one of several *absorbing* end states.
+
+```{r fig-states, class.source="fold-hide", fig.height=3.6, fig.alt="Diagram: patients start in an event-free state and can move to progression to PCM (cause 1, the event of interest) or to death without PCM (cause 2, the competing event)."}
+boxes <- data.frame(
+  xmin = c(0, 5.2, 5.2), xmax = c(3.4, 9, 9),
+  ymin = c(-0.55, 0.75, -1.95), ymax = c(0.55, 1.85, -0.85),
+  fill = c(tint_gray, tint_blue, tint_orange),
+  edge = c(muted, col_blue, col_orange),
+  label = c("Alive and event-free\n(at risk of both events)",
+            "Cause 1: progression to PCM\n(event of interest)",
+            "Cause 2: death without PCM\n(competing event)")
+)
+ggplot() +
+  geom_rect(data = boxes, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill, colour = edge),
+            linewidth = 0.9) +
+  geom_text(data = boxes, aes(x = (xmin + xmax) / 2, y = (ymin + ymax) / 2, label = label),
+            colour = ink, size = 3.9, lineheight = 1.05) +
+  annotate("segment", x = 3.45, xend = 5.1, y = 0.2, yend = 1.0, colour = ink2, linewidth = 0.8,
+           arrow = arrow(length = unit(0.18, "cm"), type = "closed")) +
+  annotate("segment", x = 3.45, xend = 5.1, y = -0.2, yend = -1.1, colour = ink2, linewidth = 0.8,
+           arrow = arrow(length = unit(0.18, "cm"), type = "closed")) +
+  annotate("text", x = 4.05, y = 0.88, label = "lambda[1](t)", parse = TRUE, colour = ink2, size = 4.4) +
+  annotate("text", x = 4.05, y = -0.93, label = "lambda[2](t)", parse = TRUE, colour = ink2, size = 4.4) +
+  scale_fill_identity() + scale_colour_identity() +
+  coord_cartesian(xlim = c(-0.2, 9.2), ylim = c(-2.1, 2.0)) +
+  theme_void() +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+```
+
+<p class="caption">Figure 1. The competing-risks model. The two arrows carry the *cause-specific hazards* $\lambda_1(t)$ and $\lambda_2(t)$, defined in Section 3. Only the first event is recorded, so each person ends in exactly one box.</p>
+
+# Setting up: notation and data layout {#setup}
+
+## Basic terms at a glance
+
+| Term | Plain meaning |
+|---|---|
+| **Origin** | The time clock starts (diagnosis, transplant, enrolment). |
+| **Event of interest** (cause 1) | The outcome your research question is about. |
+| **Competing event** (cause 2, 3, ...) | Any other outcome that keeps the event of interest from ever being seen. |
+| **$T$** | Time from origin to the *first* event of any type. |
+| **$\varepsilon$** | The *type* (cause) of that first event: $\varepsilon \in \{1, 2, \dots, K\}$. |
+| **$C$** | Censoring time: when follow-up would stop if no event happened. |
+| **Risk set** | People who are still event-free *and* still under observation at time $t$. |
+| **Hazard** | An instantaneous event rate among those still at risk. |
+| **Cumulative incidence** | The *probability* that a given cause has happened by time $t$. |
+
+What we actually observe for person $i$ is the pair
+
+$$
+X_i = \min(T_i, C_i), \qquad \delta_i = \begin{cases} \varepsilon_i & \text{if } T_i \le C_i \ \ (\text{an event was seen}),\\ 0 & \text{if } T_i > C_i \ \ (\text{censored}). \end{cases}
+$$
+
+::: {.inwords}
+$X_i$ is "how long we watched person $i$", and $\delta_i$ is "what ended the watching": $0$ for censoring, $1$ for the event of interest, $2$ for the competing event.
+:::
+
+Throughout this tutorial $K = 2$ unless stated otherwise (extending to more causes only means adding more terms to each sum).
+
+## What the data look like
+
+Competing-risks data have one row per person: a time, and a status code.
+
+```{r toy-data}
+toy <- data.frame(
+  id     = 1:10,
+  time   = c(2, 3, 4, 5, 6, 7, 8, 9, 10, 12),
+  status = c(1, 2, 1, 0, 1, 2, 0, 1, 2, 0)
+)
+toy
+```
+
+Here status `0` = censored, `1` = event of interest, `2` = competing event. We will reuse these ten fictional patients for a calculation by hand in Section 5.
+
+## Two kinds of question
+
+The same data can answer two different questions, and the right method depends on which one you are asking.
+
+::: {.keyidea}
+- **Aetiological ("why") questions.** *Does this exposure change the biological rate at which cause 1 strikes?* Compare **cause-specific hazards**.
+- **Prognostic ("how likely") questions.** *What is the real-world probability that a patient has cause 1 by 10 years?* Use the **cumulative incidence function**.
+:::
+
+## A 30-second refresher on ordinary survival analysis
+
+If there were only one type of event, then with $T$ the event time:
+
+- Survival function: $S(t) = \Pr(T > t)$.
+- Hazard: $\lambda(t) = \lim_{\Delta t \to 0} \Pr(t \le T < t + \Delta t \mid T \ge t) / \Delta t$, the instantaneous rate among those still at risk.
+- Kaplan–Meier: $\hat S(t) = \prod_{t_j \le t} \left(1 - \dfrac{d_j}{n_j}\right)$, where $d_j$ events occur among $n_j$ people at risk at time $t_j$.
+- Cox model: $\lambda(t \mid x) = \lambda_0(t)\, e^{\beta^\top x}$.
+
+With one event type, $1 - S(t)$ is *the* probability of the event by time $t$. With competing events, that identity breaks, and the next section shows why.
+
+# Key quantities: formulae and what they mean {#quantities}
+
+## Cause-specific hazard
+
+$$
+\lambda_k(t) \;=\; \lim_{\Delta t \to 0} \frac{\Pr\left(t \le T < t + \Delta t,\ \varepsilon = k \,\middle|\, T \ge t\right)}{\Delta t}, \qquad k = 1, 2.
+$$
+
+The cumulative version is $\Lambda_k(t) = \int_0^t \lambda_k(u)\,du$.
+
+::: {.inwords}
+Gather everyone who is **still event-free** at time $t$ (no event of *any* type yet). Then $\lambda_k(t)$ is the rate per unit time at which cause $k$ strikes that group, right now. It answers: "among people still standing, how fast is cause $k$ knocking them down?"
+:::
+
+Two things to notice. First, the condition $T \ge t$ means the denominator is people *not yet having had any event*, so people who had a competing event leave the risk set for good. Second, $\lambda_k(t)$ is a *rate*, not a probability, and it can exceed 1.
+
+## Overall hazard and event-free survival
+
+Because only one event can happen first, the rates simply add:
+
+$$
+\lambda(t) = \lambda_1(t) + \lambda_2(t), \qquad S(t) = \Pr(T > t) = \exp\{-\Lambda_1(t) - \Lambda_2(t)\}.
+$$
+
+::: {.inwords}
+Your chance of still being event-free at time $t$ depends on **all** the causes that could get you, not just the one you study. Remove any cause and the survival curve changes.
+:::
+
+## Cumulative incidence function (CIF)
+
+$$
+F_k(t) \;=\; \Pr(T \le t,\ \varepsilon = k) \;=\; \int_0^t S(u^-)\, \lambda_k(u)\, du .
+$$
+
+::: {.inwords}
+To end up in box $k$ by time $t$, you must (i) still be event-free just before some moment $u$, which has probability $S(u^-)$, and (ii) be hit by cause $k$ at that moment, which has rate $\lambda_k(u)$. Add this up over every moment $u$ from $0$ to $t$. That is the probability of *cause $k$ having happened by $t$*, in the real world where the other causes are also active.
+:::
+
+Three facts worth memorising:
+
+1. **The pieces add to one:** $F_1(t) + F_2(t) + S(t) = 1$ at every time $t$.
+2. **The CIF is not a survival function.** As $t \to \infty$, $F_k(t)$ levels off at $\Pr(\varepsilon = k)$, which is usually *less than 1*.
+3. **$F_k$ depends on every hazard**, through $S(u^-)$, not only on $\lambda_k$.
+
+::: {.example}
+**A closed form.** If both hazards are constant, $\lambda_1(t) \equiv \lambda_1$ and $\lambda_2(t) \equiv \lambda_2$, then
+$$
+F_1(t) = \frac{\lambda_1}{\lambda_1 + \lambda_2}\Bigl\{1 - e^{-(\lambda_1 + \lambda_2)t}\Bigr\}, \qquad F_1(\infty) = \frac{\lambda_1}{\lambda_1 + \lambda_2}.
+$$
+With $\lambda_1 = 0.10$ and $\lambda_2 = 0.20$ per year, cause 1 can only ever claim one third of all people (0.10/0.30), no matter how long we wait.
+:::
+
+The next figure holds $\lambda_1 = 0.1$ fixed and changes only the competing hazard $\lambda_2$.
+
+```{r fig-cif-lambda2, class.source="fold-hide", fig.height=4.4, fig.alt="Cumulative incidence of cause 1 over 20 years for four values of the competing hazard. A larger competing hazard gives a lower curve, even though the cause 1 hazard is the same."}
+l1 <- 0.1
+tgrid <- seq(0, 20, by = 0.05)
+curves <- bind_rows(
+  lapply(c(0.05, 0.2, 0.5), function(l2) {
+    data.frame(t = tgrid, cif = l1 / (l1 + l2) * (1 - exp(-(l1 + l2) * tgrid)), l2 = l2)
+  })
+)
+curves_none <- data.frame(t = tgrid, cif = 1 - exp(-l1 * tgrid))
+labs_df <- data.frame(
+  t = 20.2, cif = c(l1 / (l1 + 0.05) * (1 - exp(-(l1 + 0.05) * 20)),
+                    l1 / (l1 + 0.2) * (1 - exp(-(l1 + 0.2) * 20)),
+                    l1 / (l1 + 0.5) * (1 - exp(-(l1 + 0.5) * 20)),
+                    1 - exp(-l1 * 20)),
+  txt = c("competing hazard 0.05", "competing hazard 0.20", "competing hazard 0.50", "no competing event (0)")
+)
+ggplot() +
+  geom_line(data = curves_none, aes(t, cif), colour = ink, linetype = "dashed", linewidth = 0.9) +
+  geom_line(data = curves, aes(t, cif, colour = factor(l2)), linewidth = 1) +
+  geom_text(data = labs_df, aes(t, cif, label = txt), hjust = 0, size = 3.5, colour = ink2) +
+  scale_colour_manual(values = setNames(blue_ramp, c("0.05", "0.2", "0.5")), guide = "none") +
+  scale_x_continuous(limits = c(0, 28), breaks = seq(0, 20, 5)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(x = "Years since origin", y = "Cumulative incidence of cause 1",
+       title = "Same cause-1 hazard, different cause-1 risk",
+       subtitle = "Cause-1 hazard fixed at 0.10 per year; only the competing hazard changes")
+```
+
+<p class="caption">Figure 2. Cumulative incidence of cause 1 for $\lambda_1 = 0.10$ and three values of the competing hazard $\lambda_2$. The dashed line is what you would get if there were no competing event at all.</p>
+
+::: {.keyidea}
+The probability of cause 1 depends on the **competing hazard** too. A treatment that does nothing to cause 1 but makes people more likely to die of something else will *lower* the cumulative incidence of cause 1. This is why the CIF answers a prognostic question and cannot, by itself, answer an aetiological one.
+:::
+
+The three "state probabilities" $F_1(t)$, $F_2(t)$ and $S(t)$ always partition the whole population. Here they are for $\lambda_1 = 0.10$ and $\lambda_2 = 0.20$:
+
+```{r fig-stacked-theory, class.source="fold-hide", fig.height=4, fig.alt="Stacked area chart over 15 years. The blue area (cause 1) and orange area (cause 2) grow while the grey event-free area shrinks; the three areas always add to 100 percent."}
+l1 <- 0.1; l2 <- 0.2
+tg <- seq(0, 15, by = 0.05)
+st <- data.frame(
+  t = rep(tg, 3),
+  state = factor(rep(c("Event-free", "Cause 2 occurred", "Cause 1 occurred"), each = length(tg)),
+                 levels = c("Event-free", "Cause 2 occurred", "Cause 1 occurred")),
+  p = c(exp(-(l1 + l2) * tg),
+        l2 / (l1 + l2) * (1 - exp(-(l1 + l2) * tg)),
+        l1 / (l1 + l2) * (1 - exp(-(l1 + l2) * tg)))
+)
+ggplot(st, aes(t, p, fill = state)) +
+  geom_area(colour = "white", linewidth = 0.7, outline.type = "upper") +
+  scale_fill_manual(values = c("Event-free" = tint_gray, "Cause 2 occurred" = col_orange, "Cause 1 occurred" = col_blue),
+                    breaks = c("Cause 1 occurred", "Cause 2 occurred", "Event-free")) +
+  annotate("text", x = 12.5, y = 0.15, label = "F[1](t)", parse = TRUE, colour = "white", size = 5) +
+  annotate("text", x = 12.5, y = 0.5, label = "F[2](t)", parse = TRUE, colour = "white", size = 5) +
+  annotate("text", x = 1.5, y = 0.86, label = "S(t)", parse = TRUE, colour = ink2, size = 5) +
+  scale_y_continuous(labels = percent, expand = c(0, 0)) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Years since origin", y = "Share of the population",
+       title = "Where everyone is at time t")
+```
+
+<p class="caption">Figure 3. The three probabilities $F_1(t)$, $F_2(t)$ and $S(t)$ stack to 100% at every time.</p>
+
+## The "net" probability and why it is hypothetical
+
+Suppose you ignore the competing event and compute $1 - \exp\{-\Lambda_1(t)\}$, which is what a Kaplan–Meier-type analysis treating cause 2 as censoring estimates. This is the probability of cause 1 in an imaginary world where cause 2 has been *abolished* and nothing else changes. It is called the **net** probability, whereas the CIF is the **crude** (real-world) probability.
+
+The net probability is always at least as large as the CIF:
+
+$$
+F_1(t) = \int_0^t S(u^-)\lambda_1(u)\,du \;\le\; \int_0^t e^{-\Lambda_1(u)}\lambda_1(u)\,du = 1 - e^{-\Lambda_1(t)},
+$$
+
+because $S(u) = e^{-\Lambda_1(u) - \Lambda_2(u)} \le e^{-\Lambda_1(u)}$. The gap is larger the more dangerous the competing event is.
+
+::: {.pitfall}
+The net probability is rarely what a patient, doctor or health planner wants, since nobody lives in a world without the competing event. Moreover, interpreting it as a real quantity needs an *untestable* assumption that the cause-specific "latent" failure times are independent (Tsiatis, 1975).
+:::
+
+## Subdistribution hazard
+
+$$
+\gamma_k(t) = \lim_{\Delta t \to 0} \frac{\Pr\bigl\{t \le T < t + \Delta t,\ \varepsilon = k \,\bigm|\, T \ge t \ \ \text{or}\ \ (T < t \ \text{and}\ \varepsilon \ne k)\bigr\}}{\Delta t} = -\frac{d}{dt}\log\{1 - F_k(t)\}.
+$$
+
+Equivalently, $F_k(t) = 1 - \exp\{-\Gamma_k(t)\}$ with $\Gamma_k(t) = \int_0^t \gamma_k(u)\,du$, and
+
+$$
+\gamma_k(t) = \frac{S(t^-)\,\lambda_k(t)}{1 - F_k(t^-)}.
+$$
+
+::: {.inwords}
+The subdistribution hazard also looks at "people at risk of cause $k$", but it **keeps in the risk set those who already had the competing event**. They stay there forever (they can never have cause $k$, but we pretend they are still "available"). The reward for this odd convention is a hazard that is in one-to-one correspondence with the CIF, so a regression model on $\gamma_k$ is directly a model for the cumulative incidence.
+:::
+
+The last formula shows that $\gamma_k$ is *not* a pure property of cause $k$: it mixes $\lambda_k$ with the survival function $S$ and with $F_k$ itself, which depend on the competing hazard as well.
+
+## Summary table
+
+| Quantity | Symbol | The question it answers | Estimated by | Regression model |
+|---|---|---|---|---|
+| Cause-specific hazard | $\lambda_k(t)$ | How fast does cause $k$ strike those still event-free? | Nelson–Aalen increments $d_{kj}/n_j$ | Cause-specific Cox |
+| Event-free survival | $S(t)$ | What fraction has had *no* event of any type? | Kaplan–Meier (any event = failure) | Cox on the composite event |
+| Cumulative incidence | $F_k(t)$ | What is the probability of cause $k$ by time $t$? | Aalen–Johansen | Fine–Gray, or built from all $\lambda_k$ |
+| Subdistribution hazard | $\gamma_k(t)$ | How does the risk of cause $k$ evolve among people who have not had cause $k$? | Weighted Nelson–Aalen | Fine–Gray |
+| Net probability | $1 - e^{-\Lambda_k(t)}$ | What if the competing events were abolished? | $1 - \text{KM}$ (others censored) | (not recommended for risk) |
+
+# Why the usual Kaplan–Meier curve goes wrong {#km-wrong}
+
+To see the problem with certainty we need to know the truth, so we simulate. Everyone is born event-free; cause 1 strikes at constant rate $0.10$ per year, cause 2 at $0.20$ per year, and independent censoring happens at rate $0.05$ per year. The true CIF of cause 1 is $\tfrac{1}{3}\{1 - e^{-0.3t}\}$ from Section 3.
+
+```{r sim-km}
+set.seed(2026)
+n <- 3000
+l1 <- 0.10
+l2 <- 0.20
+event_time <- rexp(n, l1 + l2)
+cause <- ifelse(runif(n) < l1 / (l1 + l2), 1, 2)
+cens_time <- rexp(n, 0.05)
+
+sim <- data.frame(
+  time   = pmin(event_time, cens_time),
+  status = ifelse(event_time <= cens_time, cause, 0)
+)
+sim$event <- factor(sim$status, levels = 0:2, labels = c("censor", "cause1", "cause2"))
+table(sim$event)
+```
+
+We estimate the cumulative incidence of cause 1 in two ways: the **naive** way (one minus Kaplan–Meier, treating cause-2 events as censored) and the **correct** way (Aalen–Johansen, Section 5).
+
+```{r sim-km-fit}
+fit_naive <- survfit(Surv(time, status == 1) ~ 1, data = sim)
+fit_aj <- survfit(Surv(time, event) ~ 1, data = sim)
+
+tt <- c(2, 5, 10, 15)
+data.frame(
+  years = tt,
+  truth = l1 / (l1 + l2) * (1 - exp(-(l1 + l2) * tt)),
+  aalen_johansen = summary(fit_aj, times = tt)$pstate[, match("cause1", fit_aj$states)],
+  naive_1_minus_KM = 1 - summary(fit_naive, times = tt)$surv
+) |>
+  mutate(across(-years, ~ round(.x, 3)))
+```
+
+```{r fig-sim-km, class.source="fold-hide", fig.height=4.6, fig.alt="Line chart over 15 years. The true cumulative incidence (dashed) levels off near one third; the Aalen-Johansen estimate follows it closely; the naive one minus Kaplan-Meier estimate keeps climbing far above it."}
+tg <- seq(0, 15, by = 0.05)
+truth <- data.frame(t = tg, est = l1 / (l1 + l2) * (1 - exp(-(l1 + l2) * tg)))
+aj_df <- data.frame(t = c(0, fit_aj$time), est = c(0, fit_aj$pstate[, match("cause1", fit_aj$states)]))
+nv_df <- data.frame(t = c(0, fit_naive$time), est = c(0, 1 - fit_naive$surv))
+ggplot() +
+  geom_step(data = nv_df[nv_df$t <= 15, ], aes(t, est), colour = col_aqua, linewidth = 1) +
+  geom_step(data = aj_df[aj_df$t <= 15, ], aes(t, est), colour = col_blue, linewidth = 1) +
+  geom_line(data = truth, aes(t, est), colour = ink, linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = 15.2, y = 0.80, label = "naive 1 - KM", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 15.2, y = 0.375, label = "Aalen-Johansen", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 15.2, y = 0.29, label = "truth", hjust = 0, size = 3.7, colour = ink2) +
+  scale_x_continuous(limits = c(0, 19.5), breaks = seq(0, 15, 5)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(x = "Years since origin", y = "Estimated probability of cause 1",
+       title = "Treating competing events as censoring overstates the risk",
+       subtitle = "Simulated data, n = 3000; the dashed line is the exact answer")
+```
+
+<p class="caption">Figure 4. The naive $1 - \text{KM}$ curve heads towards 100%, but cause 1 can only ever claim one third of the population.</p>
+
+::: {.inwords}
+Kaplan–Meier with censoring pretends that everybody who died of cause 2 is still out there, "carrying on" with the same cause-1 risk as the others. Those phantom people are then eventually assigned a cause-1 event, which inflates the curve. For constant hazards, $1 - \text{KM}$ converges to $1 - e^{-\lambda_1 t}$, which tends to 1, while the truth tends to $\lambda_1/(\lambda_1+\lambda_2) = 1/3$.
+:::
+
+# Estimating the cumulative incidence {#estimation}
+
+## The formulae
+
+Order the distinct event times $t_1 < t_2 < \dots$. At $t_j$ let $n_j$ be the number at risk (event-free and under observation), $d_{kj}$ the number of cause-$k$ events, and $d_j = d_{1j} + d_{2j}$.
+
+$$
+\hat S(t) = \prod_{t_j \le t}\left(1 - \frac{d_j}{n_j}\right), \qquad
+\hat\Lambda_k(t) = \sum_{t_j \le t} \frac{d_{kj}}{n_j}, \qquad
+\hat F_k(t) = \sum_{t_j \le t} \hat S(t_{j-1})\,\frac{d_{kj}}{n_j}.
+$$
+
+::: {.inwords}
+At every event time, ask "what share of the people still standing were hit by cause $k$ just now?", which is $d_{kj}/n_j$. Weight that share by the fraction $\hat S(t_{j-1})$ of the **original** population that was still standing before that moment, and keep a running total. The weighting is the whole story: it converts "a share of survivors" into "a share of everyone".
+:::
+
+The estimator for $\hat F_k$ is called the **Aalen–Johansen** estimator (or just the "nonparametric CIF estimator"). It is the plug-in version of the integral $\int S(u^-)\,d\Lambda_k(u)$.
+
+## Doing it by hand
+
+Take the ten patients from Section 2. We build the table one column at a time.
+
+```{r toy-table}
+tab <- toy |>
+  group_by(time) |>
+  summarise(d1 = sum(status == 1), d2 = sum(status == 2), censored = sum(status == 0), .groups = "drop")
+
+tab$n_at_risk <- nrow(toy) - cumsum(c(0, head(tab$d1 + tab$d2 + tab$censored, -1)))
+tab$S_before <- c(1, head(cumprod(1 - (tab$d1 + tab$d2) / tab$n_at_risk), -1))
+tab$inc1 <- tab$S_before * tab$d1 / tab$n_at_risk
+tab$inc2 <- tab$S_before * tab$d2 / tab$n_at_risk
+tab$F1 <- cumsum(tab$inc1)
+tab$F2 <- cumsum(tab$inc2)
+tab$S <- cumprod(1 - (tab$d1 + tab$d2) / tab$n_at_risk)
+
+knitr::kable(tab, digits = 3,
+             col.names = c("t", "d1", "d2", "censored", "n at risk", "S(t-)", "S(t-) d1/n", "S(t-) d2/n", "F1(t)", "F2(t)", "S(t)"))
+```
+
+Read a row: at $t = 6$ there are $n = 6$ people at risk, one of them has the event of interest, and $\hat S(5) = 0.70$ of the original ten are still event-free. The increment to $\hat F_1$ is $0.70 \times 1/6 = 0.117$. Notice also that $\hat F_1 + \hat F_2 + \hat S = 1$ in every row, and that **censored people only leave the risk set**: they change $n$ but not $d$.
+
+Now check against the software:
+
+```{r toy-check}
+ci_toy <- cuminc(toy$time, toy$status)
+ci_toy$`1 1`[c("time", "est")] |> as.data.frame() |> mutate(est = round(est, 3)) |> t()
+```
+
+```{r toy-naive}
+c(
+  CIF_cause1_at_end = tail(tab$F1, 1),
+  naive_1_minus_KM = tail(1 - survfit(Surv(time, status == 1) ~ 1, data = toy)$surv, 1)
+)
+```
+
+The cumulative incidence of cause 1 at the end is `r fmt(tail(tab$F1, 1), 3)`, but the naive curve gives `r fmt(tail(1 - survfit(Surv(time, status == 1) ~ 1, data = toy)$surv, 1), 3)`, already a visible overestimate with only ten patients.
+
+```{r fig-toy, class.source="fold-hide", fig.height=4, fig.alt="Step functions for the ten-patient example: cumulative incidence of cause 1 in blue, of cause 2 in orange, and the event-free curve in grey."}
+toy_long <- bind_rows(
+  data.frame(t = c(0, tab$time), est = c(0, tab$F1), what = "Cause 1 (CIF)"),
+  data.frame(t = c(0, tab$time), est = c(0, tab$F2), what = "Cause 2 (CIF)"),
+  data.frame(t = c(0, tab$time), est = c(1, tab$S), what = "Event-free S(t)")
+)
+ggplot(toy_long, aes(t, est, colour = what)) +
+  geom_step(linewidth = 1) +
+  scale_colour_manual(values = c("Cause 1 (CIF)" = col_blue, "Cause 2 (CIF)" = col_orange, "Event-free S(t)" = muted)) +
+  annotate("text", x = 12.2, y = 0.47, label = "cause 1", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 12.2, y = 0.37, label = "cause 2", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 12.2, y = 0.156, label = "event-free", hjust = 0, size = 3.7, colour = ink2) +
+  scale_x_continuous(limits = c(0, 14.5), breaks = seq(0, 12, 2)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(x = "Time", y = "Probability", title = "The ten-patient example")
+```
+
+<p class="caption">Figure 5. The ten-patient example. Whenever the grey curve steps down, one of the other two steps up by the same amount.</p>
+
+## Confidence intervals and the `survfit` route
+
+Standard errors of $\hat F_k$ come from delta-method formulae due to Aalen (1978) and are returned automatically by software. Two equivalent routes are used in this tutorial:
+
+- `cmprsk::cuminc()` is the classic function and also produces Gray's test (Section 6).
+- `survival::survfit()` with a *multi-state outcome* (a factor whose first level is "censor") gives the same estimates, plus confidence limits, in a format that is easy to plot.
+
+# Comparing groups {#comparing}
+
+There are two natural tests, and they answer different questions.
+
+| Test | What it compares | Question |
+|---|---|---|
+| **Cause-specific log-rank** | $\lambda_k(t)$ between groups (other causes censored) | Do groups differ in the *rate* of cause $k$? |
+| **Gray's test** (Gray, 1988) | Cumulative incidence $F_k(t)$ between groups | Do groups differ in the *probability* of cause $k$? |
+
+::: {.inwords}
+Gray's test is the competing-risks cousin of the log-rank test, except that it compares *subdistribution* hazards. It can say "different" even when the cause-specific hazards of cause $k$ are identical, simply because the groups differ in their competing hazards. Both tests are valid; they just ask different things.
+:::
+
+Both are run on real data in Section 8.
+
+# Regression models {#regression}
+
+## Cause-specific Cox model
+
+For each cause $k$ separately, model the cause-specific hazard:
+
+$$
+\lambda_k(t \mid x) = \lambda_{k0}(t)\,\exp(\beta_k^\top x).
+$$
+
+In practice this means fitting an ordinary Cox model for cause $k$ in which **people with any other event are treated as censored at their event time**. The partial likelihood is
+
+$$
+L_k(\beta) = \prod_{i:\ \varepsilon_i = k} \frac{\exp(\beta^\top x_i)}{\sum_{j \in R(X_i)} \exp(\beta^\top x_j)}, \qquad R(t) = \{j : X_j \ge t\}.
+$$
+
+::: {.inwords}
+$e^{\beta_{k,m}}$ is the factor by which a one-unit increase in covariate $m$ multiplies the *instantaneous rate of cause $k$ among people still event-free*. This is the natural quantity for questions of mechanism: "does smoking raise the rate of heart disease deaths?"
+:::
+
+Censoring competing events is entirely appropriate **here**: the target is a rate among those at risk, and people with a competing event are, correctly, no longer at risk.
+
+## Fine–Gray subdistribution hazard model
+
+Fine and Gray (1999) model the subdistribution hazard instead:
+
+$$
+\gamma_k(t \mid x) = \gamma_{k0}(t)\,\exp(\theta_k^\top x), \qquad\text{equivalently}\qquad 1 - F_k(t \mid x) = \{1 - F_{k0}(t)\}^{\exp(\theta_k^\top x)} .
+$$
+
+Because $\gamma_k$ keeps people with a competing event in the risk set, the partial likelihood must down-weight them over time to account for censoring they would have experienced had they remained under observation. The risk set at time $t$ is $\tilde R(t)$ = (those still event-free) plus (those who already had a competing event), with weights
+
+$$
+w_j(t) = \begin{cases} 1 & \text{if } j \text{ is event-free or has had cause } k, \\[2pt] \dfrac{\hat G(t)}{\hat G(X_j)} & \text{if } j \text{ had a competing event at } X_j < t, \end{cases}
+$$
+
+where $\hat G$ is the Kaplan–Meier estimate of the *censoring* distribution.
+
+::: {.inwords}
+A person who died of a competing event stays "in the room", but fades: their weight shrinks as the time since their death grows, mimicking the chance that they would have been lost to follow-up by now. A covariate coefficient $\theta$ with $e^\theta > 1$ means **higher cumulative incidence** of cause $k$; $e^\theta < 1$ means lower.
+:::
+
+## Two models, two answers
+
+::: {.pitfall}
+A subdistribution hazard ratio (SHR) is **not** "the effect on the biological rate of cause $k$". It mixes the effect of the covariate on cause $k$ with its effect on every competing cause. A covariate can have a cause-specific hazard ratio of exactly 1 and still have an SHR different from 1.
+:::
+
+We demonstrate with a simulation in which a binary group indicator `g` (think of it as "frailer patients") has **no effect at all** on cause 1 ($\lambda_1 = 0.10$ in both groups) but triples the competing hazard ($\lambda_2 = 0.10$ versus $0.30$).
+
+```{r sim-csh-fg}
+set.seed(7)
+n <- 6000
+g <- rbinom(n, 1, 0.5)
+t1 <- rexp(n, 0.10)
+t2 <- rexp(n, ifelse(g == 1, 0.30, 0.10))
+cc <- runif(n, 0, 20)
+
+s3 <- data.frame(time = pmin(t1, t2, cc), g = g)
+s3$status <- ifelse(s3$time == cc, 0, ifelse(t1 < t2, 1, 2))
+s3$event <- factor(s3$status, 0:2, c("censor", "cause1", "cause2"))
+
+csh1 <- coxph(Surv(time, status == 1) ~ g, data = s3)
+csh2 <- coxph(Surv(time, status == 2) ~ g, data = s3)
+fg1 <- crr(s3$time, s3$status, matrix(s3$g, ncol = 1), failcode = 1, cencode = 0)
+
+data.frame(
+  model = c("Cause-specific hazard ratio, cause 1", "Cause-specific hazard ratio, cause 2",
+            "Subdistribution hazard ratio, cause 1"),
+  truth = c("1", "3", "no simple truth"),
+  estimate = round(c(exp(coef(csh1)), exp(coef(csh2)), exp(fg1$coef)), 2)
+)
+```
+
+The cause-specific model for cause 1 correctly reports "no effect" (HR $\approx$ 1), and the one for cause 2 recovers the tripling. The Fine–Gray model for cause 1 reports an SHR of about `r fmt(exp(fg1$coef), 2)`, which is a *real* difference in cumulative incidence, because frailer patients are removed by the competing event before cause 1 can occur:
+
+```{r fig-sim-csh-fg, class.source="fold-hide", fig.height=4.2, fig.alt="Cumulative incidence of cause 1 by group. The group with the higher competing hazard has a clearly lower curve even though its cause-1 hazard is identical."}
+fit_g <- survfit(Surv(time, event) ~ g, data = s3)
+idx <- match("cause1", fit_g$states)
+grp <- rep(c("g = 0 (competing hazard 0.10)", "g = 1 (competing hazard 0.30)"), fit_g$strata)
+cif_g <- data.frame(t = fit_g$time, est = fit_g$pstate[, idx], grp = grp)
+cif_g <- bind_rows(cif_g, data.frame(t = 0, est = 0, grp = unique(grp)))
+ggplot(cif_g[cif_g$t <= 15, ], aes(t, est, colour = grp)) +
+  geom_step(linewidth = 1) +
+  scale_colour_manual(values = c(col_blue, col_orange)) +
+  annotate("text", x = 15.2, y = 0.475, label = "g = 0", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 15.2, y = 0.25, label = "g = 1", hjust = 0, size = 3.7, colour = ink2) +
+  scale_x_continuous(limits = c(0, 17.5), breaks = seq(0, 15, 5)) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.6)) +
+  labs(x = "Years since origin", y = "Cumulative incidence of cause 1",
+       title = "Identical cause-1 hazard, different cause-1 risk")
+```
+
+<p class="caption">Figure 6. Group $g = 1$ has the same cause-1 hazard as group $g = 0$ but a three times higher competing hazard, so its cumulative incidence of cause 1 is substantially lower.</p>
+
+## Which model should I use?
+
+| If your goal is... | Prefer | Why |
+|---|---|---|
+| Understand *mechanism* or *aetiology*: does exposure $x$ act on cause $k$? | Cause-specific Cox, for **every** cause | Hazard ratios isolate the effect on each cause. |
+| Estimate the *absolute risk* of cause $k$ for a patient profile | Combine cause-specific models into a CIF, **or** Fine–Gray | The CIF needs all hazards; FG models it directly. |
+| Build a *prediction tool* for the probability of cause $k$ | Fine–Gray, or cause-specific models combined | Predictions are on the probability scale. |
+| Compare treatments in a trial | Report **both** CIFs and cause-specific hazard ratios | Latouche et al. (2013), Austin et al. (2016). |
+
+::: {.keyidea}
+There is no single "correct" competing-risks regression. The cause-specific hazards describe *how* the events arise; the cumulative incidence describes *how likely* each outcome is. A complete analysis reports both views.
+:::
+
+# A real data analysis in R: the MGUS cohort {#mgus}
+
+## The data
+
+The `mgus2` data set in the `survival` package follows 1,384 patients with MGUS from the Mayo Clinic. Time is measured in months from diagnosis. See `?mgus2` for the source. The relevant variables are:
+
+| Variable | Meaning |
+|---|---|
+| `age` | Age at diagnosis (years) |
+| `sex` | Female / male |
+| `hgb` | Hemoglobin (g/dL) |
+| `creat` | Serum creatinine (mg/dL) |
+| `mspike` | Size of the monoclonal serum protein spike (g/dL), a marker of the abnormal clone |
+| `ptime`, `pstat` | Time to PCM (or last contact) and its status (1 = PCM) |
+| `futime`, `death` | Time to last follow-up and death status (1 = dead) |
+
+The data record progression and death separately. A patient who progresses to PCM and later dies has `pstat = 1` and `death = 1`; here we care about the **first** event only. We build a single time and a three-level status:
+
+```{r mgus-data}
+mgus <- mgus2
+mgus$etime <- with(mgus, ifelse(pstat == 0, futime, ptime))
+mgus$event <- with(mgus, ifelse(pstat == 0, 2 * death, 1))
+mgus$event <- factor(mgus$event, levels = 0:2, labels = c("censor", "pcm", "death"))
+mgus$status <- as.integer(mgus$event) - 1L
+mgus$years <- mgus$etime / 12
+mgus$age10 <- mgus$age / 10
+
+head(mgus[, c("id", "age", "sex", "hgb", "mspike", "years", "event", "status")])
+```
+
+::: {.pitfall}
+`event` must be a factor whose **first level is the censoring label**. That is how `survfit()` knows the outcome is multi-state. If you start with a 0/1/2 numeric code, wrap it in `factor(code, 0:2, c("censor", "event1", "event2"))`.
+:::
+
+## First look: how many events of each type?
+
+```{r mgus-counts}
+counts <- table(mgus$event)
+tab_counts <- data.frame(
+  outcome = c("Censored (still alive, no PCM)", "Progressed to PCM (event of interest)", "Died without PCM (competing event)"),
+  n = as.integer(counts),
+  percent = round(100 * as.integer(counts) / sum(counts), 1)
+)
+knitr::kable(tab_counts, col.names = c("First event", "Patients", "%"))
+```
+
+Most patients (`r fmt(100 * mean(mgus$event == "death"), 0)`%) *die without PCM*, while only `r fmt(100 * mean(mgus$event == "pcm"), 0)`% progress. The competing event is far more frequent than the event of interest, which is exactly the situation where ignoring it does the most damage.
+
+How long was follow-up? The "reverse Kaplan–Meier" treats *censoring* as the event, giving a sensible median follow-up time:
+
+```{r mgus-followup}
+rev_km <- survfit(Surv(years, event == "censor") ~ 1, data = mgus)
+round(summary(rev_km)$table["median"], 1)
+```
+
+## Overall picture: where is everybody over time?
+
+The multi-state `survfit()` gives the three state probabilities $\hat S(t)$, $\hat F_1(t)$ and $\hat F_2(t)$ in one go.
+
+```{r mgus-aj}
+aj_all <- survfit(Surv(years, event) ~ 1, data = mgus)
+aj_all$states
+summary(aj_all, times = c(5, 10, 20))$pstate |>
+  `colnames<-`(aj_all$states) |>
+  `rownames<-`(c("5 years", "10 years", "20 years")) |>
+  round(3)
+```
+
+```{r fig-mgus-stacked, class.source="fold-hide", fig.height=4.4, fig.alt="Stacked areas over 30 years for the MGUS cohort: grey event-free share shrinking quickly, a large orange area for death without PCM and a thin blue area for progression to PCM."}
+t_all <- c(0, aj_all$time)
+st_all <- data.frame(
+  t = rep(t_all, 3),
+  state = factor(rep(c("Event-free", "Death without PCM", "Progressed to PCM"), each = length(t_all)),
+                 levels = c("Event-free", "Death without PCM", "Progressed to PCM")),
+  p = c(c(1, aj_all$pstate[, match("(s0)", aj_all$states)]),
+        c(0, aj_all$pstate[, match("death", aj_all$states)]),
+        c(0, aj_all$pstate[, match("pcm", aj_all$states)]))
+)
+ggplot(st_all[st_all$t <= 30, ], aes(t, p, fill = state)) +
+  geom_area(colour = "white", linewidth = 0.6, outline.type = "upper") +
+  scale_fill_manual(values = c("Event-free" = tint_gray, "Death without PCM" = col_orange, "Progressed to PCM" = col_blue),
+                    breaks = c("Progressed to PCM", "Death without PCM", "Event-free")) +
+  annotate("text", x = 26, y = 0.05, label = "PCM", colour = "white", size = 4.2, fontface = "bold") +
+  annotate("text", x = 24, y = 0.5, label = "death without PCM", colour = "white", size = 4.4, fontface = "bold") +
+  annotate("text", x = 22, y = 0.93, label = "event-free", colour = ink2, size = 4.2) +
+  scale_y_continuous(labels = percent, expand = c(0, 0)) +
+  scale_x_continuous(expand = c(0, 0), breaks = seq(0, 30, 5)) +
+  labs(x = "Years since MGUS diagnosis", y = "Share of patients",
+       title = "Over time, most MGUS patients die without ever developing PCM")
+```
+
+<p class="caption">Figure 7. State probabilities for the MGUS cohort (Aalen–Johansen). At any time the three bands sum to 100%. Estimates beyond about 25 years rest on very few patients.</p>
+
+This single picture already tells the clinical story: PCM is a real but modest risk, while most patients are claimed by competing causes of death.
+
+## The cost of ignoring the competing event
+
+We compare the naive $1 - \text{KM}$ for PCM (treating deaths as censored) with the proper cumulative incidence.
+
+```{r naive-vs-cif}
+naive_pcm <- survfit(Surv(years, event == "pcm") ~ 1, data = mgus)
+naive_death <- survfit(Surv(years, event == "death") ~ 1, data = mgus)
+
+tt <- c(5, 10, 20, 30)
+cmp <- data.frame(
+  years = tt,
+  CIF_pcm = summary(aj_all, times = tt)$pstate[, match("pcm", aj_all$states)],
+  naive_pcm = 1 - summary(naive_pcm, times = tt)$surv,
+  CIF_death = summary(aj_all, times = tt)$pstate[, match("death", aj_all$states)],
+  naive_death = 1 - summary(naive_death, times = tt)$surv
+)
+cmp$naive_sum <- cmp$naive_pcm + cmp$naive_death
+cmp$CIF_sum <- cmp$CIF_pcm + cmp$CIF_death
+knitr::kable(cmp, digits = 3,
+             col.names = c("Years", "PCM: CIF", "PCM: 1 - KM", "Death: CIF", "Death: 1 - KM",
+                           "Sum of 1 - KM", "Sum of CIFs"))
+```
+
+```{r fig-naive-mgus, class.source="fold-hide", fig.height=4.4, fig.alt="Progression to PCM in the MGUS cohort: the correct cumulative incidence rises slowly to about 13 percent by 30 years, while the naive one minus Kaplan-Meier estimate climbs well above it."}
+cif_pcm <- data.frame(t = c(0, aj_all$time), est = c(0, aj_all$pstate[, match("pcm", aj_all$states)]))
+nv_pcm <- data.frame(t = c(0, naive_pcm$time), est = c(0, 1 - naive_pcm$surv))
+ggplot() +
+  geom_step(data = nv_pcm[nv_pcm$t <= 30, ], aes(t, est), colour = col_aqua, linewidth = 1) +
+  geom_step(data = cif_pcm[cif_pcm$t <= 30, ], aes(t, est), colour = col_blue, linewidth = 1) +
+  annotate("text", x = 30.4, y = 0.43, label = "naive 1 - KM", hjust = 0, size = 3.7, colour = ink2) +
+  annotate("text", x = 30.4, y = 0.13, label = "cumulative incidence", hjust = 0, size = 3.7, colour = ink2) +
+  scale_x_continuous(limits = c(0, 40), breaks = seq(0, 30, 5)) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.5)) +
+  labs(x = "Years since MGUS diagnosis", y = "Probability of progression to PCM",
+       title = "Naive Kaplan-Meier overstates PCM risk",
+       subtitle = "Deaths without PCM treated as censored (aqua) vs counted as a competing event (blue)")
+```
+
+<p class="caption">Figure 8. Progression to PCM in the MGUS cohort: naive versus correct estimate.</p>
+
+At 20 years the naive curve gives `r fmt(100 * cmp$naive_pcm[cmp$years == 20], 1)`% while the cumulative incidence is `r fmt(100 * cmp$CIF_pcm[cmp$years == 20], 1)`%: the naive figure is about `r fmt(cmp$naive_pcm[cmp$years == 20] / cmp$CIF_pcm[cmp$years == 20], 1)` times too large. By 30 years the two naive "probabilities" (for PCM and for death) add up to `r fmt(cmp$naive_sum[cmp$years == 30], 2)`, impossible for two mutually exclusive outcomes, whereas the cumulative incidences always add up to at most 1.
+
+## Comparing the sexes
+
+Now the CIFs separately for women and men. We use `survfit()` for the curves and confidence intervals and `cuminc()` for Gray's test. First a small helper that turns a multi-state `survfit` object into a tidy data frame:
+
+```{r tidy-helper}
+tidy_cif <- function(fit) {
+  grp <- if (is.null(fit$strata)) rep("All", length(fit$time)) else rep(names(fit$strata), fit$strata)
+  grp <- sub("^[^=]+=", "", grp)
+  out <- lapply(seq_along(fit$states), function(j) {
+    data.frame(t = fit$time, group = grp, state = fit$states[j],
+               est = fit$pstate[, j], lower = fit$lower[, j], upper = fit$upper[, j])
+  })
+  do.call(rbind, out)
+}
+```
+
+```{r cif-sex}
+aj_sex <- survfit(Surv(years, event) ~ sex, data = mgus)
+cif_sex <- tidy_cif(aj_sex)
+
+gray <- cuminc(mgus$years, mgus$status, group = mgus$sex)
+gray$Tests
+```
+
+The first row is for PCM (cause 1) and the second for death without PCM (cause 2). Gray's test gives `r pfmt(gray$Tests[1, "pv"])` for PCM and `r pfmt(gray$Tests[2, "pv"])` for death.
+
+```{r fig-cif-sex, class.source="fold-hide", fig.height=4.6, fig.alt="Two panels of cumulative incidence curves with confidence bands for women and men. The PCM panel shows overlapping curves; the death panel shows men with higher cumulative incidence."}
+plot_df <- cif_sex |>
+  filter(state %in% c("pcm", "death")) |>
+  mutate(state = factor(state, c("pcm", "death"), c("Progression to PCM", "Death without PCM")))
+state_levels <- levels(plot_df$state)
+zero_rows <- expand.grid(t = 0, group = unique(plot_df$group), state = state_levels, stringsAsFactors = FALSE) |>
+  mutate(est = 0, lower = 0, upper = 0)
+plot_df <- plot_df |>
+  mutate(state = as.character(state)) |>
+  bind_rows(zero_rows) |>
+  mutate(state = factor(state, levels = state_levels))
+ptxt <- data.frame(
+  state = factor(c("Progression to PCM", "Death without PCM"), levels = levels(plot_df$state)),
+  label = paste0("Gray's test: ", pfmt(gray$Tests[, "pv"]))
+)
+ggplot(plot_df[plot_df$t <= 30, ], aes(t, est, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.14, colour = NA) +
+  geom_step(linewidth = 1) +
+  geom_text(data = ptxt, aes(x = 1, y = 1, label = label), inherit.aes = FALSE,
+            hjust = 0, vjust = 1.2, size = 3.6, colour = ink2) +
+  facet_wrap(~ state) +
+  scale_colour_manual(values = c(F = col_blue, M = col_orange), labels = c(F = "Women", M = "Men")) +
+  scale_fill_manual(values = c(F = col_blue, M = col_orange), labels = c(F = "Women", M = "Men")) +
+  scale_x_continuous(breaks = seq(0, 30, 10)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(x = "Years since MGUS diagnosis", y = "Cumulative incidence",
+       title = "Cumulative incidence by sex (95% confidence bands)")
+```
+
+<p class="caption">Figure 9. Cumulative incidence of PCM and of death without PCM, by sex.</p>
+
+Interpretation: the cumulative incidence of PCM does not differ convincingly between women and men (at 10 years about `r fmt(100 * summary(aj_sex, times = 10)$pstate[1, match("pcm", aj_sex$states)], 1)`% in women and `r fmt(100 * summary(aj_sex, times = 10)$pstate[2, match("pcm", aj_sex$states)], 1)`% in men, and the confidence bands overlap throughout). Death without PCM, however, is clearly more frequent in men.
+
+For comparison, the cause-specific log-rank tests:
+
+```{r logrank-sex}
+survdiff(Surv(years, event == "pcm") ~ sex, data = mgus)$chisq
+survdiff(Surv(years, event == "death") ~ sex, data = mgus)$chisq
+```
+
+(These are chi-square statistics on 1 degree of freedom; `qchisq(0.95, 1)` = `r fmt(qchisq(0.95, 1), 2)` is the 5% critical value.)
+
+## The cumulative hazard view
+
+Cause-specific cumulative hazards are Nelson–Aalen sums $\hat\Lambda_k(t) = \sum_{t_j \le t} d_{kj}/n_j$, with other causes treated as censoring. They show the *rate* picture rather than the *probability* picture:
+
+```{r na-hazards}
+na_curve <- function(cause) {
+  f <- survfit(Surv(years, event == cause) ~ 1, data = mgus)
+  data.frame(t = f$time, H = cumsum(f$n.event / f$n.risk), cause = cause)
+}
+na_df <- bind_rows(na_curve("pcm"), na_curve("death"))
+```
+
+```{r fig-na, class.source="fold-hide", fig.height=4.2, fig.alt="Nelson-Aalen cumulative cause-specific hazards for the MGUS cohort: the hazard of death without PCM accumulates much faster than the hazard of PCM."}
+na_end <- na_df |>
+  filter(t <= 25) |>
+  group_by(cause) |>
+  slice_max(t, n = 1) |>
+  mutate(label = ifelse(cause == "pcm", "PCM", "death without PCM"))
+ggplot(na_df[na_df$t <= 25, ], aes(t, H, colour = cause)) +
+  geom_step(linewidth = 1) +
+  geom_text(data = na_end, aes(x = 25.3, y = H, label = label), inherit.aes = FALSE,
+            hjust = 0, size = 3.7, colour = ink2) +
+  scale_colour_manual(values = c(pcm = col_blue, death = col_orange), guide = "none") +
+  scale_x_continuous(limits = c(0, 33), breaks = seq(0, 25, 5)) +
+  labs(x = "Years since MGUS diagnosis", y = "Cumulative cause-specific hazard",
+       title = "Cumulative cause-specific hazards (Nelson-Aalen)")
+```
+
+<p class="caption">Figure 10. Cumulative cause-specific hazards. A cumulative hazard is not a probability and can exceed 1.</p>
+
+## Regression: which patient characteristics matter?
+
+We model four baseline covariates: age (per 10 years), sex, hemoglobin and the size of the M-spike. Creatinine is left out to avoid additional missing data, and we use the `r sum(complete.cases(mgus[, c("age", "sex", "hgb", "mspike")]))` patients with complete data on the four covariates.
+
+```{r reg-data}
+dd <- mgus[complete.cases(mgus[, c("age", "sex", "hgb", "mspike")]), ]
+x <- model.matrix(~ age10 + sex + hgb + mspike, data = dd)[, -1]
+head(x, 3)
+```
+
+**Cause-specific Cox models**, one per cause, each treating the other cause as censoring:
+
+```{r cs-cox}
+cs_pcm <- coxph(Surv(years, event == "pcm") ~ age10 + sex + hgb + mspike, data = dd)
+cs_death <- coxph(Surv(years, event == "death") ~ age10 + sex + hgb + mspike, data = dd)
+```
+
+**Fine–Gray models**, one per cause, with `crr()` from `cmprsk`:
+
+```{r fg-fit}
+fg_pcm <- crr(dd$years, dd$status, x, failcode = 1, cencode = 0)
+fg_death <- crr(dd$years, dd$status, x, failcode = 2, cencode = 0)
+```
+
+We gather all four fits into one table.
+
+```{r reg-table}
+term_labels <- c(age10 = "Age (per 10 years)", sexM = "Male vs female",
+                 hgb = "Hemoglobin (per g/dL)", mspike = "M-spike (per g/dL)")
+
+csh_tab <- function(fit, cause) {
+  s <- summary(fit)$conf.int
+  data.frame(cause = cause, term = rownames(s), est = s[, "exp(coef)"],
+             lo = s[, "lower .95"], hi = s[, "upper .95"], method = "Cause-specific HR")
+}
+fg_tab <- function(fit, cause) {
+  s <- summary(fit)$conf.int
+  data.frame(cause = cause, term = rownames(s), est = s[, "exp(coef)"],
+             lo = s[, "2.5%"], hi = s[, "97.5%"], method = "Fine-Gray SHR")
+}
+
+results <- bind_rows(
+  csh_tab(cs_pcm, "Progression to PCM"), fg_tab(fg_pcm, "Progression to PCM"),
+  csh_tab(cs_death, "Death without PCM"), fg_tab(fg_death, "Death without PCM")
+) |>
+  mutate(term = factor(term_labels[term], levels = rev(term_labels)),
+         cause = factor(cause, levels = c("Progression to PCM", "Death without PCM")),
+         txt = sprintf("%.2f (%.2f to %.2f)", est, lo, hi))
+
+wide <- results |>
+  select(cause, term, method, txt) |>
+  pivot_wider(names_from = method, values_from = txt) |>
+  arrange(cause, desc(as.integer(term)))
+```
+
+```{r reg-table-pcm}
+knitr::kable(filter(wide, cause == "Progression to PCM")[, -1],
+             caption = "Event of interest: progression to PCM. Estimates with 95% confidence intervals.")
+```
+
+```{r reg-table-death}
+knitr::kable(filter(wide, cause == "Death without PCM")[, -1],
+             caption = "Competing event: death without PCM. Estimates with 95% confidence intervals.")
+```
+
+```{r fig-forest, class.source="fold-hide", fig.height=5.2, fig.alt="Forest plot with two panels. Each covariate has two estimates: the cause-specific hazard ratio and the Fine-Gray subdistribution hazard ratio. For PCM, age has a hazard ratio above 1 but a subdistribution hazard ratio below 1."}
+ggplot(results, aes(x = est, y = term, colour = method, shape = method)) +
+  geom_vline(xintercept = 1, colour = axis_col, linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, linewidth = 0.9,
+                 position = position_dodge(width = 0.55)) +
+  geom_point(size = 2.8, position = position_dodge(width = 0.55)) +
+  facet_wrap(~ cause) +
+  scale_x_log10(breaks = c(0.5, 0.75, 1, 1.5, 2, 3)) +
+  scale_colour_manual(values = c("Cause-specific HR" = col_blue, "Fine-Gray SHR" = col_orange)) +
+  scale_shape_manual(values = c("Cause-specific HR" = 16, "Fine-Gray SHR" = 15)) +
+  labs(x = "Hazard ratio (log scale, 95% CI)", y = NULL,
+       title = "Cause-specific and subdistribution effects can disagree")
+```
+
+<p class="caption">Figure 11. Cause-specific hazard ratios (blue circles) and Fine–Gray subdistribution hazard ratios (orange squares) for the same covariates.</p>
+
+### Reading the results
+
+```{r pick-helper, include=FALSE}
+pick <- function(cause, term, method, col = "est") {
+  r <- results[results$cause == cause & results$term == term_labels[term] & results$method == method, ]
+  r[[col]]
+}
+```
+
+**Progression to PCM (the event of interest).**
+
+- **M-spike** is the dominant risk factor under both views: each 1 g/dL increase multiplies the cause-specific hazard by `r fmt(pick("Progression to PCM", "mspike", "Cause-specific HR"))` and the subdistribution hazard by `r fmt(pick("Progression to PCM", "mspike", "Fine-Gray SHR"))`. The two agree because M-spike barely affects the competing hazard of death.
+- **Age** shows the textbook discrepancy. Its cause-specific HR is `r fmt(pick("Progression to PCM", "age10", "Cause-specific HR"))` per decade (confidence interval `r fmt(pick("Progression to PCM", "age10", "Cause-specific HR", "lo"))` to `r fmt(pick("Progression to PCM", "age10", "Cause-specific HR", "hi"))`, so older age does not clearly change the *rate* of progression) yet its Fine–Gray SHR is `r fmt(pick("Progression to PCM", "age10", "Fine-Gray SHR"))` (`r fmt(pick("Progression to PCM", "age10", "Fine-Gray SHR", "lo"))` to `r fmt(pick("Progression to PCM", "age10", "Fine-Gray SHR", "hi"))`): older patients have a *lower cumulative incidence* of PCM, simply because they are much more likely to die first (see the death model below).
+- **Hemoglobin** has a cause-specific HR of `r fmt(pick("Progression to PCM", "hgb", "Cause-specific HR"))` per g/dL (higher hemoglobin, slightly lower progression rate) but an SHR of `r fmt(pick("Progression to PCM", "hgb", "Fine-Gray SHR"))`, essentially no net effect on the probability of progression. Higher hemoglobin lowers the progression rate *and* lowers the death rate, so patients live longer and have more time to progress: the two effects cancel.
+
+**Death without PCM (the competing event).**
+
+- Age (HR `r fmt(pick("Death without PCM", "age10", "Cause-specific HR"))` per decade) and male sex (HR `r fmt(pick("Death without PCM", "sexM", "Cause-specific HR"))`) strongly increase the death rate, and higher hemoglobin lowers it.
+- M-spike has no clear effect on the death *rate* (HR `r fmt(pick("Death without PCM", "mspike", "Cause-specific HR"))`), but its SHR is `r fmt(pick("Death without PCM", "mspike", "Fine-Gray SHR"))`: patients with large M-spikes are more likely to progress to PCM first, which removes them from the "death without PCM" outcome. This is a competing-risks effect and not a protective biological effect of M-spike.
+
+::: {.keyidea}
+The same covariate can look harmful, neutral or even protective depending on which model you fit. Always say *which* hazard (cause-specific or subdistribution) a ratio refers to, and report the models for **all** causes.
+:::
+
+## From models to absolute risk: predicted CIFs
+
+Hazard ratios are relative. Patients and clinicians usually want **absolute** risks. We predict the cumulative incidence of PCM for a man with median hemoglobin and median M-spike, at age 60 and at age 80, in two ways.
+
+1. **From the cause-specific models.** Combine the two cumulative hazards through $F_1(t) = \sum_{t_j \le t} S(t_{j-1})\,\Delta\Lambda_1(t_j)$, where $S$ uses *both* causes.
+2. **From the Fine–Gray model**, directly.
+
+```{r predictions}
+cif_from_csh <- function(m1, m2, newdata) {
+  s1 <- survfit(m1, newdata = newdata)
+  s2 <- survfit(m2, newdata = newdata)
+  tm <- sort(unique(c(s1$time, s2$time)))
+  H1 <- stepfun(s1$time, c(0, s1$cumhaz))(tm)
+  H2 <- stepfun(s2$time, c(0, s2$cumhaz))(tm)
+  dH1 <- diff(c(0, H1))
+  dH2 <- diff(c(0, H2))
+  S_before <- exp(-c(0, head(cumsum(dH1 + dH2), -1)))
+  data.frame(time = tm, cif = cumsum(S_before * dH1))
+}
+
+profiles <- data.frame(
+  age10 = c(6, 8),
+  sex = factor("M", levels = levels(dd$sex)),
+  hgb = median(dd$hgb),
+  mspike = median(dd$mspike)
+)
+newx <- cbind(age10 = profiles$age10, sexM = 1, hgb = profiles$hgb, mspike = profiles$mspike)
+
+pred_fg <- predict(fg_pcm, cov1 = newx)
+pred_cs <- lapply(1:2, function(i) cif_from_csh(cs_pcm, cs_death, profiles[i, ]))
+
+at <- c(5, 10, 20)
+step_at <- function(time, y, xout) approx(time, y, xout = xout, method = "constant", rule = 2)$y
+pred_tab <- data.frame(
+  years = at,
+  cs_age60 = step_at(pred_cs[[1]]$time, pred_cs[[1]]$cif, at),
+  fg_age60 = step_at(pred_fg[, 1], pred_fg[, 2], at),
+  cs_age80 = step_at(pred_cs[[2]]$time, pred_cs[[2]]$cif, at),
+  fg_age80 = step_at(pred_fg[, 1], pred_fg[, 3], at)
+)
+knitr::kable(pred_tab, digits = 3,
+             col.names = c("Years", "Age 60: cause-specific", "Age 60: Fine-Gray", "Age 80: cause-specific", "Age 80: Fine-Gray"))
+```
+
+```{r fig-pred, class.source="fold-hide", fig.height=4.6, fig.alt="Predicted cumulative incidence of PCM over 20 years for a 60-year-old and an 80-year-old man, from two modelling approaches that give similar curves. The 60-year-old has a higher cumulative incidence."}
+tgrid <- seq(0, 20, by = 0.05)
+pred_df <- bind_rows(
+  data.frame(t = tgrid, est = step_at(pred_cs[[1]]$time, pred_cs[[1]]$cif, tgrid), age = "Age 60", method = "From cause-specific models"),
+  data.frame(t = tgrid, est = step_at(pred_cs[[2]]$time, pred_cs[[2]]$cif, tgrid), age = "Age 80", method = "From cause-specific models"),
+  data.frame(t = tgrid, est = step_at(pred_fg[, 1], pred_fg[, 2], tgrid), age = "Age 60", method = "Fine-Gray model"),
+  data.frame(t = tgrid, est = step_at(pred_fg[, 1], pred_fg[, 3], tgrid), age = "Age 80", method = "Fine-Gray model")
+)
+end_lab <- pred_df |> filter(method == "Fine-Gray model", t == max(t))
+ggplot(pred_df, aes(t, est, colour = age, linetype = method)) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c("Age 60" = col_blue, "Age 80" = col_orange)) +
+  scale_linetype_manual(values = c("From cause-specific models" = "solid", "Fine-Gray model" = "22")) +
+  geom_text(data = end_lab, aes(x = 20.3, y = est, label = tolower(age)), inherit.aes = FALSE,
+            hjust = 0, size = 3.7, colour = ink2) +
+  scale_x_continuous(limits = c(0, 23.5), breaks = seq(0, 20, 5)) +
+  scale_y_continuous(labels = percent, limits = c(0, NA)) +
+  labs(x = "Years since MGUS diagnosis", y = "Predicted cumulative incidence of PCM",
+       title = "Absolute risk of PCM: a man with median hemoglobin and M-spike")
+```
+
+<p class="caption">Figure 12. Two routes to the same absolute risk. Solid lines are built from the two cause-specific Cox models; dashed lines come from the Fine–Gray model.</p>
+
+The two routes tell the same story, though they are not identical (they rest on different modelling assumptions: proportionality of cause-specific hazards in one case, of subdistribution hazards in the other). Both say that, at the same hemoglobin and M-spike, an 80-year-old man has a *lower* absolute risk of PCM than a 60-year-old: even though age does not clearly change the progression *rate*, the 80-year-old is far more likely to die first. This is the competing-risk logic at work in a prediction.
+
+## Checking proportional hazards
+
+Both models assume proportional (sub)distribution hazards. A quick check for the cause-specific models uses scaled Schoenfeld residuals:
+
+```{r ph-check}
+cox.zph(cs_pcm)
+cox.zph(cs_death)
+```
+
+For PCM there is no evidence of non-proportionality (global $p =$ `r fmt(cox.zph(cs_pcm)$table["GLOBAL", "p"], 2)`). For death without PCM, however, the age effect clearly violates proportionality (the age row has a very small $p$-value): the hazard ratio for age is not constant over follow-up. In a real analysis you would then allow a time-varying age effect, stratify, or restrict follow-up. We keep the simpler model here so the tutorial stays focused on the competing-risks ideas, but you should treat the hazard ratio for age in the *death* model as an average over follow-up.
+
+# A one-page checklist {#checklist}
+
+::: {.recap}
+1. **Count the events of every type.** Report how many patients had the event of interest, how many had each competing event, and how many were censored.
+2. **Never use $1 - \text{KM}$ for incidence when competing events exist.** Plot the cumulative incidence (Aalen–Johansen) instead, and let the curves for all causes show the whole picture.
+3. **Pick the method by the question.**
+   - Mechanism, aetiology → cause-specific hazards, for *every* cause.
+   - Absolute risk, prediction → cumulative incidence, from Fine–Gray or from all cause-specific models.
+4. **Test accordingly.** Cause-specific log-rank compares rates; Gray's test compares probabilities.
+5. **Interpret ratios carefully.** A cause-specific HR is a rate ratio among those still event-free; an SHR is an effect on the cumulative incidence and is *not* a biological effect on cause $k$.
+6. **Report both** hazards and CIFs when you can (Latouche et al., 2013).
+7. **Check assumptions** (proportionality, independent censoring) and keep an eye on the number of events per covariate.
+:::
+
+## Common pitfalls
+
+::: {.pitfall}
+- **Censoring the competing event** in a Kaplan–Meier or log-rank analysis of *incidence* (Section 4).
+- **Reading a Fine–Gray hazard ratio as an aetiological effect** (Section 7.3).
+- **Reporting only the cause you care about.** A covariate that looks protective for cause 1 may simply increase the competing hazard.
+- **Predicting absolute risk from only one cause-specific model.** The probability of cause $k$ depends on the hazards of *all* causes.
+- **Ignoring the competing event because it is "rare".** If the competing event is genuinely rare, the naive and correct curves nearly coincide, but you only know that after you have checked.
+- **Mixing up** competing events with *recurrent* events (the same event repeating), *composite endpoints* (several event types combined into one event), and *semi-competing risks* (a non-terminal event that death can prevent, but not the other way around). These need different tools.
+:::
+
+## Check your understanding
+
+<details>
+<summary>1. In a study of dementia in people aged 85 and over, a researcher plots 1 − Kaplan–Meier for dementia with deaths censored. Is the curve too high or too low, and why?</summary>
+
+Too high. Deaths remove people from risk of dementia permanently, but censoring treats them as if they were still at risk and would eventually develop dementia at the same rate as the survivors. With high mortality in this age group, the overestimation can be large.
+</details>
+
+<details>
+<summary>2. Can a covariate have a cause-specific hazard ratio of 1 for cause 1 but a Fine–Gray SHR different from 1?</summary>
+
+Yes. If the covariate changes the *competing* hazard, it changes how many people are still available for cause 1, so the cumulative incidence of cause 1 changes even though the rate of cause 1 among those at risk does not. Figure 6 is an example.
+</details>
+
+<details>
+<summary>3. Do the cumulative incidence functions of all causes add to 1?</summary>
+
+Not on their own: $F_1(t) + F_2(t) + S(t) = 1$, so the cumulative incidences add up to $1 - S(t)$, which is less than 1 as long as some people are still event-free. They approach 1 only when everybody eventually has an event.
+</details>
+
+<details>
+<summary>4. Which model would you use to ask whether a drug acts directly on the rate of relapse?</summary>
+
+The cause-specific Cox model for relapse. It targets the rate among those still at risk, free of the effect of the drug on competing events.
+</details>
+
+## Try it yourself
+
+1. Re-run Section 8.5 with an age grouping (for example, under versus over 70 years) in place of sex. Does Gray's test agree with the cause-specific log-rank test?
+2. Add creatinine (`creat`) to the regression models. Which of the four estimates for PCM move the most?
+3. In the simulation of Section 4, change $\lambda_2$ to $0.02$. How close do the naive and correct curves become? What does this say about when competing risks can safely be ignored?
+4. Use `cuminc()` on the simulated data in Section 7.3 and compare the curves with Figure 6.
+
+# Going further {#further}
+
+The ideas here extend naturally to:
+
+- **Multi-state models**, where people can move between several transient and absorbing states (see Putter et al., 2007, and the `mstate` package).
+- **Other regression routes to the CIF**: direct binomial regression and pseudo-observation methods (Andersen and colleagues), and additive hazards models.
+- **Time-dependent covariates**, which need special care in Fine–Gray models.
+- **Dependent censoring** and **sensitivity analyses**.
+- **Prediction-model evaluation** with competing risks (time-dependent AUC, Brier score).
+
+Useful R packages: `survival`, `cmprsk`, `riskRegression`, `prodlim`, `mstate`, `tidycmprsk`, `ggsurvfit`, `timereg`.
+
+## Selected references {.unnumbered}
+
+**Books**
+
+<ol class="refs">
+<li>Kalbfleisch JD, Prentice RL. <em>The Statistical Analysis of Failure Time Data</em>, 2nd ed. Wiley; 2002.</li>
+<li>Crowder MJ. <em>Classical Competing Risks</em>. Chapman &amp; Hall/CRC; 2001.</li>
+<li>Pintilie M. <em>Competing Risks: A Practical Perspective</em>. Wiley; 2006.</li>
+<li>Aalen OO, Borgan Ø, Gjessing HK. <em>Survival and Event History Analysis: A Process Point of View</em>. Springer; 2008.</li>
+<li>Beyersmann J, Allignol A, Schumacher M. <em>Competing Risks and Multistate Models with R</em>. Springer; 2012.</li>
+</ol>
+
+**Methods and review papers**
+
+<ol class="refs" start="6">
+<li>Prentice RL, Kalbfleisch JD, Peterson AV, Flournoy N, Farewell VT, Breslow NE. The analysis of failure times in the presence of competing risks. <em>Biometrics</em> 1978;34(4):541–554.</li>
+<li>Tsiatis A. A nonidentifiability aspect of the problem of competing risks. <em>Proceedings of the National Academy of Sciences</em> 1975;72(1):20–22.</li>
+<li>Gray RJ. A class of K-sample tests for comparing the cumulative incidence of a competing risk. <em>Annals of Statistics</em> 1988;16(3):1141–1154.</li>
+<li>Fine JP, Gray RJ. A proportional hazards model for the subdistribution of a competing risk. <em>Journal of the American Statistical Association</em> 1999;94(446):496–509.</li>
+<li>Gooley TA, Leisenring W, Crowley J, Storer BE. Estimation of failure probabilities in the presence of competing risks: new representations of old estimators. <em>Statistics in Medicine</em> 1999;18(6):695–706.</li>
+<li>Putter H, Fiocco M, Geskus RB. Tutorial in biostatistics: competing risks and multi-state models. <em>Statistics in Medicine</em> 2007;26(11):2389–2430.</li>
+<li>Kim HT. Cumulative incidence in competing risks data and competing risks regression analysis. <em>Clinical Cancer Research</em> 2007;13(2):559–565.</li>
+<li>Lau B, Cole SR, Gange SJ. Competing risk regression models for epidemiologic data. <em>American Journal of Epidemiology</em> 2009;170(2):244–256.</li>
+<li>Andersen PK, Geskus RB, de Witte T, Putter H. Competing risks in epidemiology: possibilities and pitfalls. <em>International Journal of Epidemiology</em> 2012;41(3):861–870.</li>
+<li>Latouche A, Allignol A, Beyersmann J, Labopin M, Fine JP. A competing risks analysis should report results on all cause-specific hazards and cumulative incidence functions. <em>Journal of Clinical Epidemiology</em> 2013;66(6):648–653.</li>
+<li>Austin PC, Lee DS, Fine JP. Introduction to the analysis of survival data in the presence of competing risks. <em>Circulation</em> 2016;133(6):601–609.</li>
+<li>Austin PC, Fine JP. Practical recommendations for reporting Fine–Gray model analyses for competing risk data. <em>Statistics in Medicine</em> 2017;36(27):4391–4400.</li>
+</ol>
+
+**Data**
+
+<ol class="refs" start="18">
+<li>The <code>mgus2</code> data set, <em>survival</em> R package (see <code>?mgus2</code> for the original source).</li>
+</ol>
+
+<details>
+<summary>Reproducibility: R session information</summary>
+
+```{r session-info, class.source="fold-hide"}
+sessionInfo()
+```
+</details>
+
+<p class="footer-note">Drafted with AI assistance (Claude, by Anthropic); not peer-reviewed. Built with R Markdown. All figures and numbers are produced by the code on this page; all simulation seeds are fixed.</p>
